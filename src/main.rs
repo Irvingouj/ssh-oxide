@@ -19,6 +19,26 @@ struct HistoryEntry {
     use_count: u64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    InteractiveConnect,
+    Connect {
+        target: String,
+    },
+    InteractiveAddKey(AddKeyOptions),
+    AddKey {
+        target: String,
+        options: AddKeyOptions,
+    },
+    Help,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct AddKeyOptions {
+    port: Option<u16>,
+    key_path: Option<PathBuf>,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -28,30 +48,41 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
+    let action = parse_action(&args)?;
 
-    match args.as_slice() {
-        [] => run_interactive(),
-        [target] if target == "-h" || target == "--help" => {
+    match action {
+        Action::InteractiveConnect => run_interactive_connect(),
+        Action::Connect { target } => connect_to_target(&target),
+        Action::InteractiveAddKey(options) => run_interactive_add_key(options),
+        Action::AddKey { target, options } => add_key_to_target(&target, &options),
+        Action::Help => {
             print_help();
             Ok(())
         }
-        [target] => {
-            let target = target.trim();
-            if target.is_empty() {
-                return Err("target must not be empty".to_string());
-            }
-
-            let history_path = history_path()?;
-            let mut history = load_history(&history_path)?;
-            record_target(&mut history, target)?;
-            save_history(&history_path, &history)?;
-            exec_ssh(target)
-        }
-        _ => Err("usage: s [target]".to_string()),
     }
 }
 
-fn run_interactive() -> Result<(), String> {
+fn parse_action(args: &[String]) -> Result<Action, String> {
+    match args {
+        [] => Ok(Action::InteractiveConnect),
+        [flag] if flag == "-h" || flag == "--help" => Ok(Action::Help),
+        [command, rest @ ..] if command == "add-key" => parse_add_key_action(rest),
+        [target] => {
+            let target = target.trim();
+            if target.is_empty() {
+                return Err(
+                    "usage: s [target] | s add-key [--key <path>] [-p <port>] [target]".to_string(),
+                );
+            }
+            Ok(Action::Connect {
+                target: target.to_string(),
+            })
+        }
+        _ => Err("usage: s [target] | s add-key [--key <path>] [-p <port>] [target]".to_string()),
+    }
+}
+
+fn run_interactive_connect() -> Result<(), String> {
     let history_path = history_path()?;
     let mut history = load_history(&history_path)?;
     sort_history(&mut history);
@@ -61,20 +92,73 @@ fn run_interactive() -> Result<(), String> {
         return Ok(());
     }
 
-    let selected = select_target(&history)?;
-    exec_ssh(&selected)
+    let selected = select_target(&history, "s> ")?;
+    exec_ssh(&selected, None)
+}
+
+fn run_interactive_add_key(options: AddKeyOptions) -> Result<(), String> {
+    let history_path = history_path()?;
+    let mut history = load_history(&history_path)?;
+    sort_history(&mut history);
+
+    if history.is_empty() {
+        println!("No SSH history yet. Use: s add-key <target>");
+        return Ok(());
+    }
+
+    let selected = select_target(&history, "add-key> ")?;
+    add_key_to_target(&selected, &options)
+}
+
+fn connect_to_target(target: &str) -> Result<(), String> {
+    record_history_for_target(target)?;
+    exec_ssh(target, None)
+}
+
+fn add_key_to_target(target: &str, options: &AddKeyOptions) -> Result<(), String> {
+    let home = home_dir()?;
+    let resolved_key = resolve_public_key_path(&home, options.key_path.as_deref())?;
+    let public_key = fs::read_to_string(&resolved_key).map_err(|err| {
+        format!(
+            "failed to read public key {}: {err}",
+            resolved_key.display()
+        )
+    })?;
+    let public_key = public_key.trim();
+
+    if public_key.is_empty() {
+        return Err(format!(
+            "public key file is empty: {}",
+            resolved_key.display()
+        ));
+    }
+
+    println!("Using public key: {}", resolved_key.display());
+    record_history_for_target(target)?;
+
+    let ssh_copy_id_error = exec_ssh_copy_id(target, options.port, &resolved_key);
+    if matches!(ssh_copy_id_error, Err(ref err) if err.kind() == io::ErrorKind::NotFound) {
+        let command = build_authorized_keys_command(public_key);
+        exec_manual_add_key(target, options.port, &command)
+    } else {
+        match ssh_copy_id_error {
+            Ok(()) => Ok(()),
+            Err(err) => Err(format!("failed to exec ssh-copy-id: {err}")),
+        }
+    }
 }
 
 fn print_help() {
     println!("Usage:");
-    println!("  s          Select a recent SSH target");
-    println!("  s <target> Record target and run ssh <target>");
+    println!("  s");
+    println!("  s <target>");
+    println!("  s add-key [--key <path>] [-p <port>] [target]");
 }
 
-fn select_target(history: &[HistoryEntry]) -> Result<String, String> {
+fn select_target(history: &[HistoryEntry], prompt: &str) -> Result<String, String> {
     let options = SkimOptionsBuilder::default()
         .height(Some("50%"))
-        .prompt(Some("s> "))
+        .prompt(Some(prompt))
         .multi(false)
         .reverse(true)
         .build()
@@ -141,12 +225,173 @@ fn history_targets(history: &[HistoryEntry]) -> String {
     buffer
 }
 
-fn exec_ssh(target: &str) -> Result<(), String> {
-    let err = Command::new("ssh").arg(target).exec();
+fn resolve_public_key_path(home: &Path, explicit: Option<&Path>) -> Result<PathBuf, String> {
+    if let Some(explicit) = explicit {
+        let expanded = expand_tilde(explicit, home);
+        if expanded.is_file() {
+            return Ok(expanded);
+        }
+        return Err(format!(
+            "public key file does not exist: {}",
+            expanded.display()
+        ));
+    }
+
+    let candidates = [
+        ".ssh/id_ed25519.pub",
+        ".ssh/id_ecdsa.pub",
+        ".ssh/id_rsa.pub",
+        ".ssh/id_dsa.pub",
+    ];
+
+    for candidate in candidates {
+        let path = home.join(candidate);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+
+    Err(format!(
+        "no public key found; tried {}",
+        candidates
+            .iter()
+            .map(|candidate| home.join(candidate).display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+fn build_authorized_keys_command(public_key: &str) -> String {
+    let quoted = shell_single_quote(public_key);
+    format!(
+        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && grep -qxF {quoted} ~/.ssh/authorized_keys || printf '%s\\n' {quoted} >> ~/.ssh/authorized_keys"
+    )
+}
+
+fn exec_ssh(target: &str, port: Option<u16>) -> Result<(), String> {
+    let mut command = Command::new("ssh");
+    if let Some(port) = port {
+        command.arg("-p").arg(port.to_string());
+    }
+    let err = command.arg(target).exec();
     match err.kind() {
         io::ErrorKind::NotFound => Err("ssh is required but was not found in PATH".to_string()),
         _ => Err(format!("failed to exec ssh: {err}")),
     }
+}
+
+fn exec_ssh_copy_id(target: &str, port: Option<u16>, key_path: &Path) -> io::Result<()> {
+    let mut command = Command::new("ssh-copy-id");
+    command.arg("-i").arg(key_path);
+    if let Some(port) = port {
+        command.arg("-p").arg(port.to_string());
+    }
+    let err = command.arg(target).exec();
+    Err(err)
+}
+
+fn exec_manual_add_key(
+    target: &str,
+    port: Option<u16>,
+    remote_command: &str,
+) -> Result<(), String> {
+    let mut command = Command::new("ssh");
+    if let Some(port) = port {
+        command.arg("-p").arg(port.to_string());
+    }
+    let err = command
+        .arg(target)
+        .arg("sh")
+        .arg("-c")
+        .arg(remote_command)
+        .exec();
+    match err.kind() {
+        io::ErrorKind::NotFound => Err("ssh is required but was not found in PATH".to_string()),
+        _ => Err(format!("failed to exec ssh: {err}")),
+    }
+}
+
+fn record_history_for_target(target: &str) -> Result<(), String> {
+    let history_path = history_path()?;
+    let mut history = load_history(&history_path)?;
+    record_target(&mut history, target)?;
+    save_history(&history_path, &history)
+}
+
+fn parse_add_key_action(args: &[String]) -> Result<Action, String> {
+    let mut options = AddKeyOptions::default();
+    let mut target: Option<String> = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "-h" | "--help" => return Ok(Action::Help),
+            "-p" => {
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    "usage: s add-key [--key <path>] [-p <port>] [target]".to_string()
+                })?;
+                options.port = Some(parse_port(value)?);
+            }
+            "--key" => {
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    "usage: s add-key [--key <path>] [-p <port>] [target]".to_string()
+                })?;
+                options.key_path = Some(PathBuf::from(value));
+            }
+            value if value.starts_with('-') => {
+                return Err(format!(
+                    "unknown add-key option: {value}\nusage: s add-key [--key <path>] [-p <port>] [target]"
+                ))
+            }
+            value => {
+                if target.is_some() {
+                    return Err(
+                        "usage: s add-key [--key <path>] [-p <port>] [target]".to_string()
+                    );
+                }
+                target = Some(value.to_string());
+            }
+        }
+        index += 1;
+    }
+
+    Ok(match target {
+        Some(target) => Action::AddKey { target, options },
+        None => Action::InteractiveAddKey(options),
+    })
+}
+
+fn parse_port(value: &str) -> Result<u16, String> {
+    value
+        .parse::<u16>()
+        .map_err(|_| format!("invalid port: {value}"))
+}
+
+fn home_dir() -> Result<PathBuf, String> {
+    let home = env::var_os("HOME")
+        .ok_or_else(|| "could not determine home directory: HOME is not set".to_string())?;
+    Ok(PathBuf::from(home))
+}
+
+fn expand_tilde(path: &Path, home: &Path) -> PathBuf {
+    let Some(raw) = path.to_str() else {
+        return path.to_path_buf();
+    };
+
+    if raw == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(stripped) = raw.strip_prefix("~/") {
+        return home.join(stripped);
+    }
+
+    path.to_path_buf()
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn load_history(path: &Path) -> Result<Vec<HistoryEntry>, String> {
@@ -234,6 +479,123 @@ fn unix_timestamp_now() -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_action_defaults_to_interactive_connect() {
+        let action = parse_action(&[]).expect("parse should succeed");
+        assert_eq!(action, Action::InteractiveConnect);
+    }
+
+    #[test]
+    fn parse_action_supports_help() {
+        let args = vec!["--help".to_string()];
+        let action = parse_action(&args).expect("parse should succeed");
+        assert_eq!(action, Action::Help);
+    }
+
+    #[test]
+    fn parse_action_supports_connect_target() {
+        let args = vec!["prod".to_string()];
+        let action = parse_action(&args).expect("parse should succeed");
+        assert_eq!(
+            action,
+            Action::Connect {
+                target: "prod".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_action_supports_interactive_add_key() {
+        let args = vec!["add-key".to_string()];
+        let action = parse_action(&args).expect("parse should succeed");
+        assert_eq!(action, Action::InteractiveAddKey(AddKeyOptions::default()));
+    }
+
+    #[test]
+    fn parse_action_supports_add_key_target_and_options() {
+        let args = vec![
+            "add-key".to_string(),
+            "-p".to_string(),
+            "2222".to_string(),
+            "--key".to_string(),
+            "~/.ssh/custom.pub".to_string(),
+            "root@1.2.3.4".to_string(),
+        ];
+        let action = parse_action(&args).expect("parse should succeed");
+        assert_eq!(
+            action,
+            Action::AddKey {
+                target: "root@1.2.3.4".to_string(),
+                options: AddKeyOptions {
+                    port: Some(2222),
+                    key_path: Some(PathBuf::from("~/.ssh/custom.pub")),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_action_rejects_extra_positional_args() {
+        let args = vec![
+            "add-key".to_string(),
+            "prod".to_string(),
+            "extra".to_string(),
+        ];
+        let err = parse_action(&args).expect_err("parse should fail");
+        assert!(err.contains("usage"));
+    }
+
+    #[test]
+    fn resolve_public_key_prefers_explicit_path() {
+        let home = unique_test_dir("explicit-key-home");
+        let explicit = home.join("custom.pub");
+        fs::create_dir_all(&home).expect("dir should exist");
+        fs::write(&explicit, "ssh-ed25519 AAAA test@example\n").expect("write should succeed");
+
+        let resolved =
+            resolve_public_key_path(&home, Some(&explicit)).expect("resolution should succeed");
+
+        assert_eq!(resolved, explicit);
+        cleanup_path(&home);
+    }
+
+    #[test]
+    fn resolve_public_key_prefers_default_ed25519() {
+        let home = unique_test_dir("default-key-home");
+        let ssh_dir = home.join(".ssh");
+        let default_key = ssh_dir.join("id_ed25519.pub");
+        let fallback_key = ssh_dir.join("id_rsa.pub");
+        fs::create_dir_all(&ssh_dir).expect("dir should exist");
+        fs::write(&default_key, "ssh-ed25519 AAAA primary\n").expect("write should succeed");
+        fs::write(&fallback_key, "ssh-rsa AAAA fallback\n").expect("write should succeed");
+
+        let resolved = resolve_public_key_path(&home, None).expect("resolution should succeed");
+
+        assert_eq!(resolved, default_key);
+        cleanup_path(&home);
+    }
+
+    #[test]
+    fn resolve_public_key_falls_back_to_known_candidates() {
+        let home = unique_test_dir("fallback-key-home");
+        let ssh_dir = home.join(".ssh");
+        let fallback_key = ssh_dir.join("id_rsa.pub");
+        fs::create_dir_all(&ssh_dir).expect("dir should exist");
+        fs::write(&fallback_key, "ssh-rsa AAAA fallback\n").expect("write should succeed");
+
+        let resolved = resolve_public_key_path(&home, None).expect("resolution should succeed");
+
+        assert_eq!(resolved, fallback_key);
+        cleanup_path(&home);
+    }
+
+    #[test]
+    fn build_authorized_keys_command_escapes_single_quotes() {
+        let command = build_authorized_keys_command("ssh-ed25519 AAAA comment'o");
+        assert!(command.contains("grep -qxF"));
+        assert!(command.contains("'\"'\"'"));
+    }
 
     #[test]
     fn record_target_adds_new_entry() {
@@ -347,20 +709,30 @@ mod tests {
         assert_eq!(loaded[0].last_used_at, 42);
         assert_eq!(loaded[0].use_count, 9);
 
-        let _ = fs::remove_file(&path);
-        if let Some(parent) = path.parent() {
-            let _ = fs::remove_dir_all(parent);
-        }
+        cleanup_file_and_parent(&path);
     }
 
     fn unique_test_path(file_name: &str) -> PathBuf {
+        unique_test_dir("io-test").join(file_name)
+    }
+
+    fn unique_test_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after epoch")
             .as_nanos();
 
-        env::temp_dir()
-            .join(format!("ssh-oxide-test-{}-{nanos}", process::id()))
-            .join(file_name)
+        env::temp_dir().join(format!("ssh-oxide-{label}-{}-{nanos}", process::id()))
+    }
+
+    fn cleanup_file_and_parent(path: &Path) {
+        let _ = fs::remove_file(path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    fn cleanup_path(path: &Path) {
+        let _ = fs::remove_dir_all(path);
     }
 }
