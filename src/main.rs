@@ -166,8 +166,13 @@ fn select_target(history: &[HistoryEntry], prompt: &str) -> Result<String, Strin
 
     let input = Cursor::new(history_targets(history));
     let items = SkimItemReader::default().of_bufread(input);
-    let output = Skim::run_with(&options, Some(items))
-        .ok_or_else(|| "failed to start interactive selector".to_string())?;
+    let output = Skim::run_with(&options, Some(items));
+
+    // tuikit blocks SIGWINCH on the calling thread and does not restore the
+    // mask. OpenSSH needs this signal to forward Zellij pane resizes.
+    unblock_sigwinch()?;
+
+    let output = output.ok_or_else(|| "failed to start interactive selector".to_string())?;
 
     if output.is_abort {
         process::exit(1);
@@ -184,6 +189,27 @@ fn select_target(history: &[HistoryEntry], prompt: &str) -> Result<String, Strin
     }
 
     Ok(selected)
+}
+
+fn unblock_sigwinch() -> Result<(), String> {
+    let mut signals = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    if unsafe { libc::sigemptyset(&mut signals) } == -1
+        || unsafe { libc::sigaddset(&mut signals, libc::SIGWINCH) } == -1
+    {
+        return Err(format!(
+            "failed to restore terminal resize handling: {}",
+            io::Error::last_os_error()
+        ));
+    }
+
+    let error = unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut()) };
+    if error != 0 {
+        return Err(format!(
+            "failed to restore terminal resize handling: {}",
+            io::Error::from_raw_os_error(error)
+        ));
+    }
+    Ok(())
 }
 
 fn record_target(history: &mut Vec<HistoryEntry>, target: &str) -> Result<(), String> {
@@ -667,6 +693,42 @@ mod tests {
         ];
 
         assert_eq!(history_targets(&history), "prod\nroot@1.2.3.4\n");
+    }
+
+    #[test]
+    fn unblock_sigwinch_restores_resize_delivery_for_exec() {
+        let mut resize_signal = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        let mut original_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        assert_eq!(unsafe { libc::sigemptyset(&mut resize_signal) }, 0);
+        assert_eq!(
+            unsafe { libc::sigaddset(&mut resize_signal, libc::SIGWINCH) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &resize_signal, &mut original_mask) },
+            0
+        );
+
+        unblock_sigwinch().expect("SIGWINCH should be unblocked");
+
+        let mut current_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut current_mask)
+            },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::sigismember(&current_mask, libc::SIGWINCH) },
+            0
+        );
+
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &original_mask, std::ptr::null_mut())
+            },
+            0
+        );
     }
 
     #[test]
